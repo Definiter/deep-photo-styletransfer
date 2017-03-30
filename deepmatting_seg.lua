@@ -47,16 +47,17 @@ cmd:option('-save_iter', 100)
 cmd:option('-output_image', 'out.png') 
 cmd:option('-index', 1)
 cmd:option('-serial', 'serial_example') 
-cmd:option('-result_path', '') -- TODO
+cmd:option('-result_path', '')
 
 -- Other options
 cmd:option('-proto_file', 'models/VGG_ILSVRC_19_layers_deploy.prototxt')
 cmd:option('-model_file', 'models/VGG_ILSVRC_19_layers.caffemodel')
-cmd:option('-backend', 'nn', 'nn|cudnn|clnn')
-cmd:option('-cudnn_autotune', false)
+cmd:option('-backend', 'cudnn', 'nn|cudnn|clnn')
+cmd:option('-cudnn_autotune', true)
 cmd:option('-seed', 612)
 
-cmd:option('-content_layers', 'relu4_2', 'layers for content')
+-- cmd:option('-content_layers', 'relu4_2', 'layers for content')
+cmd:option('-content_layers', 'relu1_1', 'layers for content')
 cmd:option('-style_layers',   'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
 
 
@@ -83,17 +84,28 @@ local function main(params)
     local _, h2, w2 = style_image:size(1), style_image:size(2), style_image:size(3)
     local index = params.index
 
+    local img = nil
+    
     -- init: used for initialize the image
-    local init_image = image.load(params.init_image, 3)
-    init_image = image.scale(init_image, w, h, 'bilinear')
-    local init_image_caffe = preprocess(init_image):float():cuda()
-
+    if params.init_image == 'random' then
+        img = torch.randn(content_image:size()):float():mul(0.0001):cuda()
+        print('init_image: random')
+    else
+        local init_image = image.load(params.init_image, 3)
+        init_image = image.scale(init_image, w, h, 'bilinear')
+        img = preprocess(init_image):float():cuda()
+        print('init_image: ' .. params.init_image)
+    end
+    
+    
     -- segmentation images
     --[
     local content_seg = image.load(params.content_seg, 3)
     content_seg = image.scale(content_seg, w, h, 'bilinear')
+    print('content_seg: ' .. params.content_seg)
     local style_seg = image.load(params.style_seg, 3)
     style_seg = image.scale(style_seg, w2, h2, 'bilinear')
+    print('style_seg: ' .. params.style_seg)
     local color_codes = {'blue', 'green', 'black', 'white', 'red', 'yellow', 'grey', 'lightblue', 'purple'}
     local color_content_masks, color_style_masks = {}, {}
     for j = 1, #color_codes do
@@ -205,9 +217,6 @@ local function main(params)
     local mean_pixel = torch.CudaTensor({103.939, 116.779, 123.68})
     local meanImage = mean_pixel:view(3, 1, 1):expandAs(content_image_caffe)
 
-    local img = init_image_caffe  
-    -- local img = torch.randn(content_image:size()):float():mul(0.0001):cuda()
-
     -- Run it through the network once to get the proper size for the gradient
     -- All the gradients will come from the extra loss modules, so we just pass
     -- zeros into the top of the net on the backward pass.
@@ -235,18 +244,41 @@ local function main(params)
         end
     end
 
-    
     lfs.mkdir(params.result_path)
     local function maybe_save(t)
         local should_save = params.save_iter > 0 and t % params.save_iter == 0
         should_save = should_save or t == params.num_iterations
         if should_save then
             local disp = deprocess(img:double())
-            disp = image.minmax{tensor=disp, min=0, max=1}
-            local filename = params.result_path .. '/out_t_' .. tostring(t) .. '.png'
+            disp = image.minmax{tensor=disp, min=0, max=1} -- BUG!!!
+            local filename = params.result_path .. '/out_' .. tostring(t) .. '.png'
             image.save(filename, disp)
         end
     end
+    
+    
+    
+    -- Calculate gradient of the content image
+    sobelx = torch.Tensor({{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}})
+    sobely = torch.Tensor({{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}})
+    
+    img_x = image.convolve(content_image, sobelx, 'same')
+    img_y = image.convolve(content_image, sobely, 'same')
+
+    img_out = torch.cpow(img_x, torch.Tensor(img_x:size()):fill(2)) + torch.cpow(img_y, torch.Tensor(img_y:size()):fill(2))
+    img_out = torch.cpow(img_out, torch.Tensor(img_out:size()):fill(0.5))
+    
+    local content_gradient = image.minmax{tensor=img_out, min=torch.min(img_out), max=torch.max(img_out)}
+    image.save('data/mask/' .. (params.content_image):match("^.+/(.+)$"), content_gradient_tensor)
+    print('Mask image saved.')
+    
+    content_gradient = content_gradient:cuda()
+    
+    --local content_gradient = torch.CudaTensor()
+    --content_gradient:resize(content_gradient_tensor:size()):copy(content_gradient_tensor)
+    
+    
+    
 
     local num_calls = 0
     local function feval(AffineModel) 
@@ -261,12 +293,34 @@ local function main(params)
         local gradient_LocalAffine = MattingLaplacian(output, CSR, h, w):mul(params.lambda)
 
         if num_calls % params.save_iter == 0 then
+            -- affine
             local best = SmoothLocalAffine(output, input, params.eps, params.patch, h, w, params.f_radius, params.f_edge)
-            fn = params.result_path .. '/best_t_' .. tostring(num_calls) .. '.png'
-            image.save(fn, best)
+            image.save(params.result_path .. '/affine_' .. string.format("%04d", num_calls) .. '.png', best)
+            -- direct output
+            local output_img = deprocess(img:double())
+            image.save(params.result_path .. '/output_' .. string.format("%04d", num_calls) .. '.png', output_img)
+            print(torch.max(output_img))
+            -- output & truncate
+            --local output_img = deprocess(img:double())
+            --image.save(params.result_path .. '/output_' .. string.format("%04d", num_calls) .. '.png', output_img)
+            
         end 
 
-        local grad = torch.add(gradient_VggNetwork, gradient_LocalAffine)
+        -- Deep Matting + Segmentation
+        -- local grad = torch.add(gradient_VggNetwork, gradient_LocalAffine)
+        
+        -- Neural Style + Segmentation
+        -- local grad = gradient_VggNetwork
+        
+        -- Edge Constraint + Segmentation
+        -- local grad = torch.cmul(gradient_VggNetwork, content_gradient)
+        
+        -- Image gradient mask Loss + Segmentation
+        local gradient_edge = torch.add(img, -1, content_image_caffe):cmul(content_gradient):mul(0.1)
+        local grad = torch.add(gradient_VggNetwork, gradient_edge)
+        
+        -- Gradient layer loss + Segmentation
+        local grad = gradient_VggNetwork
 
         local loss = 0
         for _, mod in ipairs(content_losses) do
@@ -508,6 +562,8 @@ function StyleLossWithSeg:__init(strength, target_grams, color_content_masks, co
     self.color_content_masks = deepcopy(color_content_masks)
     self.color_codes = color_codes
     --self.content_seg_idxs = content_seg_idxs
+    --self.normalize = normalize -- DEBUG
+
 
     self.loss = 0
     self.gram = GramMatrix()
