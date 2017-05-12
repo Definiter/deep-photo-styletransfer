@@ -32,10 +32,15 @@ cmd:option('-tv_weight', 1e-3)
 cmd:option('-num_iterations', 1000)
 
 -- Local affine params
+cmd:option('-add_local_affine', 'true')
 cmd:option('-lambda', 1e4) 
 cmd:option('-patch', 3)
 cmd:option('-eps', 1e-7)
 cmd:option('-laplacian', '')
+
+-- Image gradient params
+cmd:option('-add_image_gradient', 'true')
+cmd:option('-grad_weight', 1000)
 
 -- Reconstruct best local affine using joint bilateral smoothing
 cmd:option('-f_radius', 7)
@@ -52,12 +57,11 @@ cmd:option('-result_path', '')
 -- Other options
 cmd:option('-proto_file', 'models/VGG_ILSVRC_19_layers_deploy.prototxt')
 cmd:option('-model_file', 'models/VGG_ILSVRC_19_layers.caffemodel')
-cmd:option('-backend', 'cudnn', 'nn|cudnn|clnn')
-cmd:option('-cudnn_autotune', true)
+cmd:option('-backend', 'nn', 'nn|cudnn|clnn')
+cmd:option('-cudnn_autotune', false)
 cmd:option('-seed', 612)
 
--- cmd:option('-content_layers', 'relu4_2', 'layers for content')
-cmd:option('-content_layers', 'relu1_1', 'layers for content')
+cmd:option('-content_layers', 'relu4_2', 'layers for content')
 cmd:option('-style_layers',   'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
 
 
@@ -130,13 +134,9 @@ local function main(params)
     local cnn = loadcaffe.load(params.proto_file, params.model_file, params.backend):float():cuda()
 
     -- load matting laplacian
-    -- DEBUG local CSR_fn = 'gen_laplacian/Input_Laplacian_'..tostring(params.patch)..'x'..tostring(params.patch)..'_1e-7_CSR' .. tostring(index) .. '.mat'
     local CSR_fn = params.laplacian
     print('loading matting laplacian...', CSR_fn)
     local CSR = matio.load(CSR_fn).CSR:cuda()
-
-    paths.mkdir(tostring(params.serial))
-    print('Exp serial:', params.serial)
 
     for i = 1, #cnn do
         if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
@@ -201,6 +201,8 @@ local function main(params)
 
         end
     end
+    print('Net: ' .. net:__tostring())
+    
 
     -- We don't need the base CNN anymore, so clean it up to save memory.
     cnn = nil
@@ -223,6 +225,65 @@ local function main(params)
     local y = net:forward(img)
     local dy = img.new(#y):zero()
 
+    
+    
+    -- Calculate gradient of the content image
+    --[[
+    sobelx = torch.Tensor({{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}})
+    sobely = torch.Tensor({{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}})
+    
+    img_x = image.convolve(content_image, sobelx, 'same')
+    img_y = image.convolve(content_image, sobely, 'same')
+
+    img_out = torch.cpow(img_x, torch.Tensor(img_x:size()):fill(2)) + torch.cpow(img_y, torch.Tensor(img_y:size()):fill(2))
+    img_out = torch.cpow(img_out, torch.Tensor(img_out:size()):fill(0.5))
+    
+    local content_gradient = image.minmax{tensor=img_out, min=torch.min(img_out), max=torch.max(img_out)}
+    print('Mask image saved at ' .. 'data/mask/' .. (params.content_image):match("^.+/(.+)$"))
+    image.save('data/mask/' .. (params.content_image):match("^.+/(.+)$"), content_gradient)
+    
+    content_gradient = content_gradient:cuda()
+    --]]
+    
+    
+    
+    
+    
+    -- Image gradient loss net.
+    local net_grad = nn.Sequential()
+    -- net_grad:add(nn.SpatialConvolution(3, 1, 3, 3))
+    --local kernel = torch.Tensor({0, -1, 0, -1, 4, -1, 0, -1, 0, 0, -1, 0, -1, 4, -1, 0, -1, 0, 0, -1, 0, -1, 4, -1, 0, -1, 0, 0}):cuda()
+    net_grad:add(nn.SpatialConvolution(3, 3, 3, 3))
+    local kernel = torch.Tensor({0, -1, 0, -1, 4, -1, 0, -1, 0, 
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0, 
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0,
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0, 
+                                 0, -1, 0, -1, 4, -1, 0, -1, 0, 
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0,
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0, 
+                                 0,  0, 0,  0, 0,  0, 0,  0, 0, 
+                                 0, -1, 0, -1, 4, -1, 0, -1, 0, 
+                                 0, 0, 0}):cuda()
+    local flatParameters, flatGradParameters = net_grad:getParameters()
+    flatParameters:copy(kernel)
+    net_grad:cuda()
+    print(net_grad:__tostring())
+    
+    local target = net_grad:forward(content_image_caffe):clone()
+    image.save('data/gradient_output/0000_target.png', image.minmax{tensor=target, min=torch.min(target), max=torch.max(target)})
+    local grad_weight = params.grad_weight
+    local gradient_loss_module = nn.ContentLoss(grad_weight, target, false):float():cuda()
+    net_grad:add(gradient_loss_module)
+    
+    local y_grad = net_grad:forward(img)
+    local dy_grad = img.new(#y_grad):zero()
+    
+    
+    
+    
+    
+    
+    
     -- Declaring this here lets us access it in maybe_print
     local optim_state = {
         maxIter = params.num_iterations,
@@ -234,63 +295,52 @@ local function main(params)
         local verbose = (params.print_iter > 0 and t % params.print_iter == 0)
         if verbose then
             print(string.format('Iteration %d / %d', t, params.num_iterations))
+            
             for i, loss_module in ipairs(content_losses) do
                 print(string.format('  Content %d loss: %f', i, loss_module.loss))
             end
             for i, loss_module in ipairs(style_losses) do
                 print(string.format('  Style %d loss: %f', i, loss_module.loss))
             end
+            print(string.format('  Image gradient loss: %f', gradient_loss_module.loss))
             print(string.format('  Total loss: %f', loss))
         end
     end
-
+ 
+    
     lfs.mkdir(params.result_path)
-    local function maybe_save(t)
-        local should_save = params.save_iter > 0 and t % params.save_iter == 0
-        should_save = should_save or t == params.num_iterations
-        if should_save then
-            local disp = deprocess(img:double())
-            disp = image.minmax{tensor=disp, min=0, max=1} -- BUG!!!
-            local filename = params.result_path .. '/out_' .. tostring(t) .. '.png'
-            image.save(filename, disp)
-        end
-    end
-    
-    
-    
-    -- Calculate gradient of the content image
-    sobelx = torch.Tensor({{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}})
-    sobely = torch.Tensor({{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}})
-    
-    img_x = image.convolve(content_image, sobelx, 'same')
-    img_y = image.convolve(content_image, sobely, 'same')
-
-    img_out = torch.cpow(img_x, torch.Tensor(img_x:size()):fill(2)) + torch.cpow(img_y, torch.Tensor(img_y:size()):fill(2))
-    img_out = torch.cpow(img_out, torch.Tensor(img_out:size()):fill(0.5))
-    
-    local content_gradient = image.minmax{tensor=img_out, min=torch.min(img_out), max=torch.max(img_out)}
-    image.save('data/mask/' .. (params.content_image):match("^.+/(.+)$"), content_gradient_tensor)
-    print('Mask image saved.')
-    
-    content_gradient = content_gradient:cuda()
-    
-    --local content_gradient = torch.CudaTensor()
-    --content_gradient:resize(content_gradient_tensor:size()):copy(content_gradient_tensor)
-    
-    
-    
-
     local num_calls = 0
     local function feval(AffineModel) 
         num_calls = num_calls + 1
 
         local output = torch.add(img, meanImage)
         local input  = torch.add(content_image_caffe, meanImage)
-
+        
+        
+        -- Gradient: neural style
         net:forward(img)
-
-        local gradient_VggNetwork = net:updateGradInput(img, dy)
-        local gradient_LocalAffine = MattingLaplacian(output, CSR, h, w):mul(params.lambda)
+        gradient_VggNetwork = net:updateGradInput(img, dy)
+        local grad = gradient_VggNetwork
+        
+        -- Gradient: local affine
+        if params.add_local_affine == 'true' then
+            gradient_LocalAffine = MattingLaplacian(output, CSR, h, w):mul(params.lambda)
+            grad = grad + gradient_LocalAffine
+        end
+        
+        -- Gradient: image gradient
+        if params.add_image_gradient == 'true' then
+            gradient_output = net_grad:forward(img)
+            gradient_ImageGradient = net_grad:updateGradInput(img, dy_grad) 
+            grad = grad + gradient_ImageGradient
+        end
+        
+        -- Edge Constraint + Segmentation
+        -- local grad = torch.cmul(gradient_VggNetwork, content_gradient)
+        
+        -- Image gradient mask Loss + Segmentation
+        -- local gradient_edge = torch.add(img, -1, content_image_caffe):cmul(content_gradient):mul(0.1)
+        -- local grad = torch.add(gradient_VggNetwork, gradient_edge)
 
         if num_calls % params.save_iter == 0 then
             -- affine
@@ -300,28 +350,14 @@ local function main(params)
             local output_img = deprocess(img:double())
             image.save(params.result_path .. '/output_' .. string.format("%04d", num_calls) .. '.png', output_img)
             print(torch.max(output_img))
-            -- output & truncate
-            --local output_img = deprocess(img:double())
-            --image.save(params.result_path .. '/output_' .. string.format("%04d", num_calls) .. '.png', output_img)
             
-        end 
-
-        -- Deep Matting + Segmentation
-        -- local grad = torch.add(gradient_VggNetwork, gradient_LocalAffine)
+            -- image gradient
+            if params.add_image_gradient == 'true' then
+                image.save(params.result_path .. '/gradient_' .. string.format("%04d", num_calls) .. '.png', image.minmax{tensor=gradient_output, min=torch.min(gradient_output), max=torch.max(gradient_output)})
+            end
+        end
         
-        -- Neural Style + Segmentation
-        -- local grad = gradient_VggNetwork
         
-        -- Edge Constraint + Segmentation
-        -- local grad = torch.cmul(gradient_VggNetwork, content_gradient)
-        
-        -- Image gradient mask Loss + Segmentation
-        local gradient_edge = torch.add(img, -1, content_image_caffe):cmul(content_gradient):mul(0.1)
-        local grad = torch.add(gradient_VggNetwork, gradient_edge)
-        
-        -- Gradient layer loss + Segmentation
-        local grad = gradient_VggNetwork
-
         local loss = 0
         for _, mod in ipairs(content_losses) do
             loss = loss + mod.loss
@@ -329,8 +365,8 @@ local function main(params)
         for _, mod in ipairs(style_losses) do
             loss = loss + mod.loss
         end
+        loss = loss + gradient_loss_module.loss
         maybe_print(num_calls, loss)
-        -- maybe_save(num_calls)
 
         collectgarbage()
 
